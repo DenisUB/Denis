@@ -1,5 +1,3 @@
-!pip install osmnx networkx matplotlib pandas -q
-
 import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
