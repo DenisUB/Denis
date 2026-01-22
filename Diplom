@@ -1,19 +1,17 @@
 import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
+from typing import Dict, Any, Optional, List, Tuple
 import hashlib
 import pickle
 from pathlib import Path
 import warnings
 import re
 import pandas as pd
-import traceback
-from matplotlib.lines import Line2D
 import matplotlib.patches as mpatches
-
-warnings.filterwarnings('ignore')
-
-# Конфигурация
+import traceback
+warnings.filterwarnings('ignore')  # Отключаем предупреждения
+# Конфигурация: значения по умолчанию для атрибутов дорог
 DEFAULT_ROAD_PROFILES = {
     'motorway': {'lanes': 4, 'maxspeed': 110, 'category': 'I', 'capacity': 2000},
     'motorway_link': {'lanes': 2, 'maxspeed': 70, 'category': 'I', 'capacity': 1500},
@@ -30,419 +28,706 @@ DEFAULT_ROAD_PROFILES = {
     'living_street': {'lanes': 1, 'maxspeed': 10, 'category': 'IV', 'capacity': 200},
     'service': {'lanes': 1, 'maxspeed': 15, 'category': 'IV', 'capacity': 150},
 }
-
+# Цветовая карта для категорий дорог
 CATEGORY_COLORS = {
-    'I': '#FF0000',     # Красный
-    'II': '#FF9900',    # Оранжевый
-    'III': '#00AA00',   # Зеленый
-    'IV': '#888888',    # Серый
+    'I': '#FF0000',     # Красный - магистрали
+    'II': '#FF9900',    # Оранжевый - основные
+    'III': '#00AA00',   # Зеленый - второстепенные
+    'IV': '#888888',    # Серый - местные
     'unknown': '#CCCCCC'
 }
-
-TRAFFIC_LIGHT_STYLES = {
-    1: {'color': '#00FF00', 'marker': 'o', 'size': 1200, 'outline_size': 1400},
-    2: {'color': '#00FF00', 'marker': 's', 'size': 1300, 'outline_size': 1500},
-    3: {'color': '#FFFF00', 'marker': '^', 'size': 1400, 'outline_size': 1600},
-    4: {'color': '#FF0000', 'marker': 'd', 'size': 1500, 'outline_size': 1700},
-    5: {'color': '#FF0000', 'marker': 'D', 'size': 1600, 'outline_size': 1800},
-    6: {'color': '#FF0000', 'marker': '*', 'size': 1700, 'outline_size': 1900},
-}
-
-def parse_speed(speed_value):
-    if speed_value is None:
-        return None
-
+def parse_speed(speed_value: Any) -> Optional[float]:
+    """
+    Преобразует значение скорости в числовой формат (км/ч).
+    Args:
+        speed_value: Значение скорости из OSM (может быть int, float, str или list)   
+    Returns:
+        Скорость в км/ч или None, если не удалось распарсить
+    """
     if isinstance(speed_value, list):
-        if speed_value:
-            speed_value = speed_value[0]
-        else:
-            return None
-
+        speed_value = speed_value[0]
+    
     if isinstance(speed_value, (int, float)):
         return float(speed_value)
-
+    
     if isinstance(speed_value, str):
-        try:
-            return float(speed_value)
-        except ValueError:
-            match = re.search(r'(\d+(?:\.\d+)?)', str(speed_value))
-            if match:
-                speed = float(match.group(1))
-                if 'mph' in speed_value.lower():
-                    speed *= 1.60934
-                return speed
-
+        match = re.search(r'(\d+(?:\.\d+)?)', str(speed_value))
+        if match:
+            speed = float(match.group(1))
+            if 'mph' in speed_value.lower():
+                speed *= 1.60934  # конвертация миль в км
+            return speed
+    
     return None
 
-def assign_road_attributes(G, road_profiles):
+def assign_road_attributes(G: nx.MultiDiGraph, road_profiles: Dict) -> nx.MultiDiGraph:
+    """
+    Назначает атрибуты дорогам на основе профилей.
+    
+    Args:
+        G: Граф дорожной сети
+        road_profiles: Словарь с профилями дорог
+    
+    Returns:
+        Граф с назначенными атрибутами
+    """
     for u, v, k, data in G.edges(keys=True, data=True):
         highway_type = data.get('highway', 'unclassified')
         if isinstance(highway_type, list):
-            highway_type = highway_type[0] if highway_type else 'unclassified'
-
+            highway_type = highway_type[0]
+        
         profile = road_profiles.get(highway_type, road_profiles['unclassified'])
-
-        lanes = data.get('lanes')
-        if lanes is None or lanes == '':
+        
+        # Назначаем стандартные атрибуты
+        if 'lanes' not in data or data['lanes'] is None:
             data['lanes'] = profile['lanes']
-        elif isinstance(lanes, str):
-            try:
-                data['lanes'] = int(float(lanes))
-            except (ValueError, TypeError):
-                data['lanes'] = profile['lanes']
-
-        speed = data.get('maxspeed')
-        if speed is None or speed == '':
+        
+        if 'maxspeed' not in data or data['maxspeed'] is None:
             data['maxspeed'] = profile['maxspeed']
         else:
-            parsed_speed = parse_speed(speed)
+            parsed_speed = parse_speed(data['maxspeed'])
             data['maxspeed'] = parsed_speed if parsed_speed else profile['maxspeed']
-
+        
+        # Добавляем дополнительные атрибуты
         data['road_category'] = profile['category']
         data['highway_type'] = highway_type
         data['capacity'] = profile['capacity']
-
-        if 'length' in data:
-            try:
-                data['length'] = float(data['length'])
-            except (ValueError, TypeError):
-                data['length'] = 100.0
-
-        if 'name' in data and data['name']:
-            if isinstance(data['name'], list):
-                data['name'] = data['name'][0]
-
+        data['original_highway'] = highway_type
+    
     return G
 
-def add_travel_time_weights(G):
+def add_travel_time_weights(G: nx.MultiDiGraph) -> None:
+    """
+    Добавляет атрибуты времени проезда и весовые коэффициенты.
+    
+    Args:
+        G: Граф дорожной сети
+    """
     for u, v, k, data in G.edges(keys=True, data=True):
-        length = data.get('length', 0)
-        if isinstance(length, str):
-            try:
-                length = float(length)
-            except ValueError:
-                length = 0.0
-        length = float(length)
-
-        speed = data.get('maxspeed', 30)
-        if isinstance(speed, str):
-            parsed_speed = parse_speed(speed)
-            speed = parsed_speed if parsed_speed else 30
-        elif speed is None:
-            speed = 30
-
-        speed = float(speed)
-
+        length = data.get('length', 0)  # в метрах
+        speed = data.get('maxspeed', 30)  # км/ч
+        
         if length > 0 and speed > 0:
+            # Время в секундах
             travel_time = (length / 1000) / speed * 3600
             data['travel_time'] = travel_time
-
+            
+            # Весовые коэффициенты в зависимости от категории дороги
             category = data.get('road_category', 'III')
             weight_multipliers = {
-                'I': 0.8, 'II': 1.0, 'III': 1.2, 'IV': 1.5, 'unknown': 1.0
+                'I': 0.8,   # Предпочтение магистралям
+                'II': 1.0,
+                'III': 1.2,
+                'IV': 1.5,
+                'unknown': 1.0
             }
             weight = travel_time * weight_multipliers.get(category, 1.0)
-
+            
             data['weight'] = weight
             data['impedance'] = travel_time * (1.0 + (4 - data.get('lanes', 1)) * 0.1)
-        else:
-            data['travel_time'] = 60
-            data['weight'] = 60
-            data['impedance'] = 60
 
-def create_road_network_graph(place_name, include_traffic_lights=False):
-    print(f"Загрузка данных OSM для: {place_name}...")
-
+def create_road_network_graph(
+    place_name: str,
+    network_type: str = 'drive',
+    simplify: bool = True,
+    intersection_tolerance: float = 15
+) -> nx.MultiDiGraph:
+    """
+    Загружает данные OSM и строит граф дорожной сети.
+    
+    Args:
+        place_name: Название места или координаты
+        network_type: Тип сети ('drive', 'walk', 'bike', 'all')
+        simplify: Упрощать ли граф
+        intersection_tolerance: Допуск для консолидации пересечений (метры)
+    
+    Returns:
+        Граф дорожной сети
+    """
+    print(f"[1/7] Загрузка данных OSM для: {place_name}...")
+    
+    # Настройка OSMnx
     ox.settings.timeout = 60
     ox.settings.log_console = False
-
+    
+    # Координаты для тестирования (Рублёвское шоссе, Москва)
+    center_point = (55.75, 37.50)
+    
     try:
-        print("   Используем название места...")
-        G = ox.graph_from_place(place_name, network_type='drive', simplify=True)
+        print("   Пробуем загрузить небольшую область по координатам...")
+        G = ox.graph_from_point(
+            center_point,
+            dist=500,
+            network_type=network_type,
+            simplify=simplify
+        )
         print(f"   Успешно! Загружено {G.number_of_nodes()} узлов и {G.number_of_edges()} ребер")
-
-        if include_traffic_lights:
-            print("   Добавление светофоров...")
-            _add_traffic_lights_based_on_topology(G)
-
+        
     except Exception as e:
         print(f"   Ошибка при загрузке из OSM: {str(e)[:100]}...")
         print("   Создаем тестовый граф для демонстрации...")
-        if include_traffic_lights:
-            G = _create_test_graph_with_traffic_lights()
-        else:
-            G = _create_test_graph()
+        G = _create_test_graph()
+    
+    # Проекция графа
+    G_proj = _project_graph(G)
+    
+    # Назначение атрибутов
+    G_proj = _apply_attributes(G_proj)
+    
+    # Расчет времени и весов
+    _calculate_travel_times(G_proj)
+    
+    # Консолидация пересечений
+    G_consolidated = _consolidate_intersections(G_proj, intersection_tolerance)
+    
+    # Очистка графа
+    G_clean = _clean_graph(G_consolidated)
+    
+    # Проверка качества данных
+    _validate_and_print_stats(G_clean)
+    
+    return G_clean
 
-    G = assign_road_attributes(G, DEFAULT_ROAD_PROFILES)
-    add_travel_time_weights(G)
-
-    print(f"\n✓ Граф построен успешно!")
-    print(f"  Узлов: {G.number_of_nodes()}")
-    print(f"  Ребер: {G.number_of_edges()}")
-
-    return G
-
-def _add_traffic_lights_based_on_topology(G):
-    print("   Добавление светофоров на основе топологии...")
-    traffic_light_count = 0
-
-    for node, data in G.nodes(data=True):
-        street_count = data.get('street_count', 0)
-        if street_count >= 3:
-            if 'traffic_lights' not in data:
-                data['traffic_lights'] = []
-
-            phases = min(max(2, street_count - 1), 5)
-            data['traffic_lights'].append({
-                'id': f"tl_{node}",
-                'lat': data.get('y', 0),
-                'lon': data.get('x', 0),
-                'type': 'traffic_signals',
-                'phases': phases,
-                'cycle_time': 60 + phases * 15
-            })
-            traffic_light_count += 1
-
-    print(f"   Добавлено {traffic_light_count} светофоров")
-
-def _create_test_graph_with_traffic_lights():
+def _create_test_graph() -> nx.MultiDiGraph:
+    """Создает тестовый граф для демонстрации работы."""
     G = nx.MultiDiGraph()
-
+    
+    # Тестовые узлы (перекрестки)
     test_nodes = [
-        (1, {'y': 55.75, 'x': 37.50, 'street_count': 4,
-             'traffic_lights': [{'id': 'tl_1', 'lat': 55.75, 'lon': 37.50, 'phases': 3}]}),
-        (2, {'y': 55.75, 'x': 37.51, 'street_count': 3,
-             'traffic_lights': [{'id': 'tl_2', 'lat': 55.75, 'lon': 37.51, 'phases': 2}]}),
+        (1, {'y': 55.75, 'x': 37.50, 'street_count': 4, 'osmid': 1001}),
+        (2, {'y': 55.75, 'x': 37.51, 'street_count': 3, 'osmid': 1002}),
         (3, {'y': 55.76, 'x': 37.50, 'street_count': 2, 'osmid': 1003}),
-        (4, {'y': 55.76, 'x': 37.51, 'street_count': 4,
-             'traffic_lights': [{'id': 'tl_4', 'lat': 55.76, 'lon': 37.51, 'phases': 4}]}),
+        (4, {'y': 55.76, 'x': 37.51, 'street_count': 4, 'osmid': 1004}),
     ]
-
+    
     for node_id, attrs in test_nodes:
         G.add_node(node_id, **attrs)
-
+    
+    # Тестовые ребра (дороги)
     test_edges = [
-        (1, 2, {'length': 850, 'highway': 'primary', 'name': 'Рублёвское шоссе'}),
-        (2, 4, {'length': 1200, 'highway': 'secondary', 'name': 'ул. Крылатская'}),
-        (4, 3, {'length': 900, 'highway': 'tertiary', 'name': 'ул. Маршала Тимошенко'}),
-        (3, 1, {'length': 1100, 'highway': 'residential', 'name': 'Барвихинская ул.'}),
+        (1, 2, {'length': 850, 'highway': 'primary', 'name': 'Рублёвское шоссе', 'osmid': 2001}),
+        (2, 4, {'length': 1200, 'highway': 'secondary', 'name': 'ул. Крылатская', 'osmid': 2002}),
+        (4, 3, {'length': 900, 'highway': 'tertiary', 'name': 'ул. Маршала Тимошенко', 'osmid': 2003}),
+        (3, 1, {'length': 1100, 'highway': 'residential', 'name': 'Барвихинская ул.', 'osmid': 2004}),
+        (1, 4, {'length': 1400, 'highway': 'primary', 'name': 'Рублёвское шоссе', 'osmid': 2005}),
+        (2, 3, {'length': 1300, 'highway': 'secondary', 'name': 'ул. Крылатские Холмы', 'osmid': 2006}),
     ]
-
+    
     for u, v, attrs in test_edges:
         G.add_edge(u, v, **attrs)
-
-    print(f"   Создан тестовый граф со светофорами: {G.number_of_nodes()} узлов, {G.number_of_edges()} ребер")
-    return G
-
-def _create_test_graph():
-    G = nx.MultiDiGraph()
-
-    test_nodes = [
-        (1, {'y': 55.75, 'x': 37.50, 'street_count': 4}),
-        (2, {'y': 55.75, 'x': 37.51, 'street_count': 3}),
-        (3, {'y': 55.76, 'x': 37.50, 'street_count': 2}),
-        (4, {'y': 55.76, 'x': 37.51, 'street_count': 4}),
-    ]
-
-    for node_id, attrs in test_nodes:
-        G.add_node(node_id, **attrs)
-
-    test_edges = [
-        (1, 2, {'length': 850, 'highway': 'primary', 'name': 'Рублёвское шоссе'}),
-        (2, 4, {'length': 1200, 'highway': 'secondary', 'name': 'ул. Крылатская'}),
-        (4, 3, {'length': 900, 'highway': 'tertiary', 'name': 'ул. Маршала Тимошенко'}),
-        (3, 1, {'length': 1100, 'highway': 'residential', 'name': 'Барвихинская ул.'}),
-    ]
-
-    for u, v, attrs in test_edges:
-        G.add_edge(u, v, **attrs)
-
+    
     print(f"   Создан тестовый граф: {G.number_of_nodes()} узлов, {G.number_of_edges()} ребер")
     return G
 
-def visualize_graph(G, save_path='road_network.png', show_traffic_lights=False):
+def _project_graph(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Проецирует граф в метрическую систему (UTM)."""
+    print("[2/7] Проекция графа в метрическую систему (UTM)...")
+    
+    if G.number_of_nodes() == 0:
+        print("   Граф пустой, пропускаем проекцию")
+        return G
+    
+    try:
+        if 'crs' not in G.graph:
+            G.graph['crs'] = 'epsg:4326'
+        G_proj = ox.project_graph(G, to_crs='EPSG:3857')
+        print("   Проекция выполнена успешно")
+        return G_proj
+    except Exception as e:
+        print(f"   Ошибка проекции: {str(e)[:100]}...")
+        return G
+
+def _apply_attributes(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Назначает атрибуты по умолчанию."""
+    print("[3/7] Назначение атрибутов по умолчанию...")
+    
+    if G.number_of_nodes() == 0:
+        print("   Граф пустой, пропускаем назначение атрибутов")
+        return G
+    
+    G = assign_road_attributes(G, DEFAULT_ROAD_PROFILES)
+    print("   Атрибуты назначены")
+    return G
+
+def _calculate_travel_times(G: nx.MultiDiGraph) -> None:
+    """Расчитывает время проезда и весовые коэффициенты."""
+    print("[4/7] Расчет времени проезда и весов...")
+    
+    if G.number_of_edges() == 0:
+        print("   Нет ребер для расчета")
+        return
+    
+    add_travel_time_weights(G)
+    print("   Время проезда и веса рассчитаны")
+
+def _consolidate_intersections(G: nx.MultiDiGraph, tolerance: float) -> nx.MultiDiGraph:
+    """Консолидирует пересечения."""
+    print("[5/7] Консолидация пересечений...")
+    
+    if G.number_of_nodes() <= 10:
+        print("   Слишком маленький граф, пропускаем консолидацию")
+        return G
+    
+    try:
+        G_consolidated = ox.consolidate_intersections(G, tolerance=tolerance)
+        print("   Консолидация выполнена")
+        return G_consolidated
+    except Exception as e:
+        print(f"   Консолидация не удалась: {str(e)[:100]}...")
+        return G
+
+def _clean_graph(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Очищает граф, оставляя только наибольшую компоненту связности."""
+    print("[6/7] Очистка графа...")
+    
+    if G.number_of_nodes() == 0:
+        return G
+    
+    try:
+        from osmnx import utils_graph
+        G_clean = utils_graph.get_largest_component(G, strongly=True)
+        print(f"   Очистка выполнена, осталось {G_clean.number_of_nodes()} узлов")
+        return G_clean
+    except Exception as e:
+        print(f"   Очистка не удалась: {str(e)[:100]}...")
+        return G
+
+def _validate_and_print_stats(G: nx.MultiDiGraph) -> None:
+    """Проверяет качество данных и выводит статистику."""
+    print("[7/7] Проверка качества данных...")
+    stats = validate_graph(G)
+    
+    print(f"\n✓ Граф построен успешно!")
+    print(f"  Узлов: {G.number_of_nodes()}")
+    print(f"  Ребер: {G.number_of_edges()}")
+    
+    if stats['max_length'] > 0:
+        print(f"  Длина самого длинного ребра: {stats['max_length']:.1f} м")
+        print(f"  Длина самого короткого ребра: {stats['min_length']:.1f} м")
+    
+    print(f"  Ребра без скорости: {stats['missing_speed']}")
+    print(f"  Ребра без полос: {stats['missing_lanes']}")
+
+def validate_graph(G: nx.MultiDiGraph) -> Dict[str, Any]:
+    """
+    Проверяет качество построенного графа.
+    
+    Returns:
+        Словарь со статистикой графа
+    """
+    lengths = []
+    stats = {
+        'total_nodes': G.number_of_nodes(),
+        'total_edges': G.number_of_edges(),
+        'missing_speed': 0,
+        'missing_lanes': 0,
+        'zero_length_edges': 0,
+        'max_length': 0,
+        'min_length': float('inf'),
+        'avg_length': 0,
+        'road_types': {},
+        'categories': {}
+    }
+    
+    for u, v, data in G.edges(data=True):
+        length = data.get('length', 0)
+        lengths.append(length)
+        
+        if length <= 0:
+            stats['zero_length_edges'] += 1
+        
+        if data.get('maxspeed') is None:
+            stats['missing_speed'] += 1
+        
+        if data.get('lanes') is None:
+            stats['missing_lanes'] += 1
+        
+        # Статистика по типам дорог
+        road_type = data.get('highway_type', 'unknown')
+        stats['road_types'][road_type] = stats['road_types'].get(road_type, 0) + 1
+        
+        # Статистика по категориям
+        category = data.get('road_category', 'unknown')
+        stats['categories'][category] = stats['categories'].get(category, 0) + 1
+    
+    if lengths:
+        stats['max_length'] = max(lengths)
+        stats['min_length'] = min(lengths)
+        stats['avg_length'] = sum(lengths) / len(lengths)
+    
+    return stats
+
+def visualize_graph(G: nx.MultiDiGraph, save_path: str = 'rublevskoe_road_network.png') -> None:
+    """
+    Визуализирует граф и сохраняет изображение.
+    
+    Args:
+        G: Граф дорожной сети
+        save_path: Путь для сохранения изображения
+    """
     if G.number_of_nodes() == 0:
         print("Граф пустой, визуализация невозможна")
         return
-
-    print(f"\nСоздание визуализации графа..." + (" со светофорами" if show_traffic_lights else ""))
-
+    
+    print(f"\nСоздание визуализации графа...")
+    
     try:
-        fig, ax = plt.subplots(figsize=(15, 12))
-
+        fig, ax = plt.subplots(figsize=(12, 12))
+        
+        # Рисуем ребра
         for u, v, data in G.edges(data=True):
             category = data.get('road_category', 'unknown')
             color = CATEGORY_COLORS.get(category, '#CCCCCC')
-
+            
             u_x, u_y = G.nodes[u].get('x', 0), G.nodes[u].get('y', 0)
             v_x, v_y = G.nodes[v].get('x', 0), G.nodes[v].get('y', 0)
-
-            linewidth = 3.0
-            if category == 'I': linewidth = 4.0
-            elif category == 'II': linewidth = 3.5
-            elif category == 'III': linewidth = 3.0
-            else: linewidth = 2.5
-
-            ax.plot([u_x, v_x], [u_y, v_y], color=color, linewidth=linewidth, alpha=0.8, zorder=1)
-
-        if show_traffic_lights:
-            print("   Рисуем светофоры...")
-            traffic_light_data = _extract_traffic_lights(G)
-
-            if traffic_light_data['x']:
-                print(f"   Найдено {len(traffic_light_data['x'])} светофоров")
-
-                phases_groups = {}
-                for x, y, phases in zip(traffic_light_data['x'],
-                                       traffic_light_data['y'],
-                                       traffic_light_data['phases']):
-                    if phases not in phases_groups:
-                        phases_groups[phases] = {'x': [], 'y': []}
-                    phases_groups[phases]['x'].append(x)
-                    phases_groups[phases]['y'].append(y)
-
-                for phases, coords in phases_groups.items():
-                    style = TRAFFIC_LIGHT_STYLES.get(phases, TRAFFIC_LIGHT_STYLES.get(3))
-                    if not style: continue
-
-                    ax.scatter(coords['x'], coords['y'],
-                              color='black', s=style['outline_size'],
-                              marker=style['marker'], alpha=0.9, zorder=5)
-
-                    ax.scatter(coords['x'], coords['y'],
-                              color=style['color'], s=style['size'],
-                              marker=style['marker'], alpha=1.0, zorder=6,
-                              edgecolors='white', linewidth=3)
-
-                    for x, y in zip(coords['x'], coords['y']):
-                        ax.text(x, y, f"{phases}", fontsize=18,
-                               ha='center', va='center', fontweight='bold',
-                               color='black', zorder=7,
-                               bbox=dict(boxstyle='circle,pad=0.3',
-                                        facecolor='white', alpha=0.8,
-                                        edgecolor='black', linewidth=2))
-
-        _format_plot(ax, G, show_traffic_lights)
-        _add_legend(ax, show_traffic_lights)
-
+            
+            ax.plot([u_x, v_x], [u_y, v_y], color=color, linewidth=3, zorder=1)
+            
+            # Подписываем дороги
+            mid_x = (u_x + v_x) / 2
+            mid_y = (u_y + v_y) / 2
+            name = data.get('name', '')
+            if name:
+                ax.text(mid_x, mid_y, name, fontsize=8, ha='center', va='center',
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                                alpha=0.7, edgecolor='none'))
+        
+        # Рисуем узлы (перекрестки)
+        node_data = _extract_node_coordinates(G)
+        if node_data['x']:
+            ax.scatter(node_data['x'], node_data['y'], color='black', s=50, 
+                      zorder=2, edgecolors='white', linewidth=1.5)
+            
+            # Подписываем узлы
+            for x, y, label in zip(node_data['x'], node_data['y'], node_data['labels']):
+                ax.text(x, y, label, fontsize=10, ha='center', va='center', 
+                       color='white', fontweight='bold', zorder=3)
+        
+        _format_plot(ax, G)
+        _add_legend(ax)
+        _add_info_panel(fig, G)
+        
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.show()
-
+        
         print(f"✓ Визуализация сохранена в файл: {save_path}")
-
     except Exception as e:
         print(f"✗ Ошибка при визуализации: {str(e)[:100]}...")
-        traceback.print_exc()
 
-def _extract_traffic_lights(G):
-    tl_x, tl_y, tl_phases = [], [], []
-
+def _extract_node_coordinates(G: nx.MultiDiGraph) -> Dict[str, list]:
+    """Извлекает координаты узлов для визуализации."""
+    node_x, node_y, node_labels = [], [], []
+    
     for node, data in G.nodes(data=True):
-        if 'traffic_lights' in data and data['traffic_lights']:
-            for tl in data['traffic_lights']:
-                lat = tl.get('lat', data.get('y', 0))
-                lon = tl.get('lon', data.get('x', 0))
+        x = data.get('x', 0)
+        y = data.get('y', 0)
+        if x != 0 and y != 0:
+            node_x.append(x)
+            node_y.append(y)
+            node_labels.append(str(node))
+    
+    return {'x': node_x, 'y': node_y, 'labels': node_labels}
 
-                if lat != 0 and lon != 0:
-                    tl_x.append(lon)
-                    tl_y.append(lat)
-                    tl_phases.append(tl.get('phases', 3))
-
-    return {'x': tl_x, 'y': tl_y, 'phases': tl_phases}
-
-def _format_plot(ax, G, show_traffic_lights=False):
-    title = "ДОРОЖНАЯ СЕТЬ РАЙОНА РУБЛЁВСКОГО ШОССЕ"
-    if show_traffic_lights:
-        title += f"\nСветофоры показаны цветными фигурами с номерами фаз"
-
-    ax.set_title(title, fontsize=18, fontweight='bold', pad=20)
-    ax.set_xlabel("Долгота (координата X)", fontsize=14)
-    ax.set_ylabel("Широта (координата Y)", fontsize=14)
-    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
+def _format_plot(ax, G: nx.MultiDiGraph) -> None:
+    """Форматирует график."""
+    ax.set_title("Дорожная сеть района Рублёвского шоссе", 
+                 fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel("Долгота", fontsize=12)
+    ax.set_ylabel("Широта", fontsize=12)
+    ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_facecolor('#f5f5f5')
 
-def _add_legend(ax, show_traffic_lights=False):
+def _add_legend(ax) -> None:
+    """Добавляет легенду на график."""
     legend_patches = []
-
     for category, color in CATEGORY_COLORS.items():
         if category != 'unknown':
-            patch = mpatches.Patch(color=color, label=f'Категория {category}', alpha=0.8)
+            patch = mpatches.Patch(color=color, label=f'Категория {category}')
             legend_patches.append(patch)
+    
+    ax.legend(handles=legend_patches, loc='upper right', fontsize=11,
+              framealpha=0.9, frameon=True, edgecolor='black')
 
-    if show_traffic_lights:
-        legend_patches.extend([
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#00FF00',
-                  markersize=15, label='1-2 фазы', markeredgecolor='black', markeredgewidth=2),
-            Line2D([0], [0], marker='^', color='w', markerfacecolor='#FFFF00',
-                  markersize=15, label='3 фазы', markeredgecolor='black', markeredgewidth=2),
-            Line2D([0], [0], marker='d', color='w', markerfacecolor='#FF0000',
-                  markersize=15, label='4+ фазы', markeredgecolor='black', markeredgewidth=2),
-        ])
+def _add_info_panel(fig, G: nx.MultiDiGraph) -> None:
+    """Добавляет информационную панель на график."""
+    info_text = f"Узлов: {G.number_of_nodes()}\nРебер: {G.number_of_edges()}"
+    fig.text(0.02, 0.98, info_text, fontsize=11, fontweight='bold',
+             bbox=dict(boxstyle='round', facecolor='white', 
+                      alpha=0.9, edgecolor='black'),
+             verticalalignment='top')
 
-    legend_patches.append(Line2D([0], [0], marker='o', color='w',
-                                markerfacecolor='darkblue', markersize=10,
-                                label='Перекрестки', markeredgecolor='white'))
+def export_graph(G: nx.MultiDiGraph, base_filename: str = 'rublevskoe_road_network') -> None:
+    """
+    Экспортирует граф в различные форматы.
+    
+    Args:
+        G: Граф дорожной сети
+        base_filename: Базовое имя файла для экспорта
+    """
+    if G.number_of_nodes() == 0:
+        print("Граф пустой, экспорт невозможен")
+        return
+    
+    print("\nЭкспорт данных...")
+    
+    # Экспорт в GraphML
+    _export_graphml(G, base_filename)
+    
+    # Экспорт в CSV
+    _export_csv(G, base_filename)
+    
+    # Экспорт статистики
+    _export_stats(G, base_filename)
 
-    ncol = 2 if show_traffic_lights else 1
-    ax.legend(handles=legend_patches, loc='upper right', fontsize=12,
-              framealpha=0.95, frameon=True, edgecolor='black', facecolor='white',
-              bbox_to_anchor=(1.0, 1.0), ncol=ncol, title='Обозначения:')
-
-def main():
-    print("=" * 60)
-    print("СИСТЕМА АНАЛИЗА ДОРОЖНОЙ СЕТИ СО СВЕТОФОРАМИ")
-    print("=" * 60)
-    print("Адаптировано для Google Colab")
-    print("=" * 60)
-
-    print("\nВыберите режим работы:")
-    print("1. Стандартный режим (без светофоров)")
-    print("2. Режим со светофорами")
-    print("3. Тест светофоров (тестовый граф)")
-
+def _export_graphml(G: nx.MultiDiGraph, base_filename: str) -> None:
+    """Экспортирует граф в формате GraphML."""
     try:
-        choice = input("\nВведите номер режима (1-3): ").strip()
-
-        if choice == "1":
-            print("\n" + "=" * 60)
-            print("СТАНДАРТНЫЙ РЕЖИМ (БЕЗ СВЕТОФОРОВ)")
-            print("=" * 60)
-
-            road_graph = create_road_network_graph('Рублёвское шоссе, Москва', include_traffic_lights=False)
-            visualize_graph(road_graph, 'road_network_no_traffic_lights.png', show_traffic_lights=False)
-
-        elif choice == "2":
-            print("\n" + "=" * 60)
-            print("РЕЖИМ СО СВЕТОФОРАМИ")
-            print("=" * 60)
-
-            road_graph = create_road_network_graph('Рублёвское шоссе, Москва', include_traffic_lights=True)
-            visualize_graph(road_graph, 'road_network_with_traffic_lights.png', show_traffic_lights=True)
-
-        elif choice == "3":
-            print("\n" + "=" * 60)
-            print("ТЕСТ СВЕТОФОРОВ (ТЕСТОВЫЙ ГРАФ)")
-            print("=" * 60)
-
-            G = _create_test_graph_with_traffic_lights()
-            visualize_graph(G, 'test_traffic_lights.png', show_traffic_lights=True)
-
-        else:
-            print("Неверный выбор, запускаю тест...")
-            G = _create_test_graph_with_traffic_lights()
-            visualize_graph(G, 'test_traffic_lights.png', show_traffic_lights=True)
-
-        print("\n" + "=" * 60)
-        print("✓ ВСЕ ОПЕРАЦИИ ЗАВЕРШЕНЫ!")
-        print("=" * 60)
-
-    except KeyboardInterrupt:
-        print("\n\nПрограмма прервана пользователем.")
+        graphml_path = f"{base_filename}.graphml"
+        nx.write_graphml(G, graphml_path)
+        print(f"  ✓ GraphML: {graphml_path}")
     except Exception as e:
-        print(f"\n✗ ОШИБКА: {e}")
-        traceback.print_exc()
+        print(f"  ✗ Ошибка экспорта GraphML: {str(e)[:100]}...")
 
-# Запуск программы
+def _export_csv(G: nx.MultiDiGraph, base_filename: str) -> None:
+    """Экспортирует данные о ребрах в CSV."""
+    try:
+        csv_path = f"{base_filename}_edges.csv"
+        edges_data = []
+        
+        for u, v, data in G.edges(data=True):
+            edge_data = {
+                'from_node': u,
+                'to_node': v,
+                'highway_type': data.get('highway_type', ''),
+                'road_category': data.get('road_category', ''),
+                'lanes': data.get('lanes', ''),
+                'maxspeed_kmh': data.get('maxspeed', ''),
+                'length_m': data.get('length', ''),
+                'travel_time_s': data.get('travel_time', ''),
+                'weight': data.get('weight', ''),
+                'capacity': data.get('capacity', ''),
+                'name': data.get('name', ''),
+                'oneway': data.get('oneway', ''),
+                'bridge': data.get('bridge', ''),
+                'tunnel': data.get('tunnel', '')
+            }
+            edges_data.append(edge_data)
+        
+        df_edges = pd.DataFrame(edges_data)
+        df_edges.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        print(f"  ✓ CSV: {csv_path}")
+    except Exception as e:
+        print(f"  ✗ Ошибка экспорта CSV: {str(e)[:100]}...")
+
+def _export_stats(G: nx.MultiDiGraph, base_filename: str) -> None:
+    """Экспортирует статистический отчет."""
+    try:
+        stats_path = f"{base_filename}_stats.txt"
+        stats = validate_graph(G)
+        
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 60 + "\n")
+            f.write("СТАТИСТИКА ДОРОЖНОЙ СЕТИ РАЙОНА РУБЛЁВСКОГО ШОССЕ\n")
+            f.write("=" * 60 + "\n\n")
+            
+            f.write(f"Общее количество узлов (перекрестков): {stats['total_nodes']}\n")
+            f.write(f"Общее количество ребер (дорожных сегментов): {stats['total_edges']}\n")
+            
+            if stats['max_length'] > 0:
+                f.write(f"Макс. длина ребра: {stats['max_length']:.1f} м\n")
+                f.write(f"Мин. длина ребра: {stats['min_length']:.1f} м\n")
+                f.write(f"Сред. длина ребра: {stats['avg_length']:.1f} м\n\n")
+            
+            f.write("РАСПРЕДЕЛЕНИЕ ПО КАТЕГОРИЯМ ДОРОГ:\n")
+            for category, count in sorted(stats['categories'].items()):
+                percentage = (count / stats['total_edges']) * 100 if stats['total_edges'] > 0 else 0
+                f.write(f"  Категория {category}: {count} ребер ({percentage:.1f}%)\n")
+            
+            f.write("\nТИПЫ ДОРОГ (топ-10):\n")
+            sorted_types = sorted(stats['road_types'].items(), 
+                                 key=lambda x: x[1], reverse=True)[:10]
+            for road_type, count in sorted_types:
+                percentage = (count / stats['total_edges']) * 100 if stats['total_edges'] > 0 else 0
+                f.write(f"  {road_type}: {count} ребер ({percentage:.1f}%)\n")
+        
+        print(f"  ✓ Статистика: {stats_path}")
+    except Exception as e:
+        print(f"  ✗ Ошибка экспорта статистики: {str(e)[:100]}...")
+
+def get_graph_cache_key(params: Dict) -> str:
+    """
+    Генерирует ключ для кэширования графа.
+    
+    Args:
+        params: Параметры для создания графа
+    
+    Returns:
+        Хэш-ключ для кэширования
+    """
+    key_str = f"rublevskoe_{str(params)}"
+    return hashlib.md5(key_str.encode()).hexdigest()[:12]
+
+def load_or_create_graph(cache_dir: str = "cache", **kwargs) -> nx.MultiDiGraph:
+    """
+    Загружает граф из кэша или создает новый.
+    
+    Args:
+        cache_dir: Директория для кэша
+        **kwargs: Параметры для create_road_network_graph
+    
+    Returns:
+        Граф дорожной сети
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(exist_ok=True)
+    
+    cache_key = get_graph_cache_key(kwargs)
+    cache_file = cache_dir / f"{cache_key}.pkl"
+    
+    if cache_file.exists():
+        print(f"Загрузка графа из кэша: {cache_file}")
+        try:
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            print("Ошибка загрузки из кэша, создаем новый граф...")
+    else:
+        print("Создание нового графа...")
+    
+    graph = create_road_network_graph(**kwargs)
+    
+    # Сохраняем в кэш
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(graph, f)
+        print(f"Граф сохранен в кэш: {cache_file}")
+    except Exception:
+        print("Не удалось сохранить граф в кэш")
+    
+    return graph
+
+def _demonstrate_graph_capabilities(road_graph: nx.MultiDiGraph) -> None:
+    """Демонстрирует возможности графа."""
+    print("\n" + "=" * 60)
+    print("ДЕМОНСТРАЦИЯ ВОЗМОЖНОСТЕЙ ГРАФА:")
+    print("=" * 60)
+    
+    # Поиск кратчайшего пути
+    _demonstrate_shortest_path(road_graph)
+    
+    # Анализ центральности
+    _demonstrate_centrality_analysis(road_graph)
+    
+    # Анализ связности
+    _demonstrate_connectivity_analysis(road_graph)
+
+def _demonstrate_shortest_path(road_graph: nx.MultiDiGraph) -> None:
+    """Демонстрирует поиск кратчайшего пути."""
+    nodes = list(road_graph.nodes())
+    if len(nodes) < 2:
+        return
+    
+    print(f"\nПоиск кратчайшего пути в графе из {len(nodes)} узлов...")
+    start_node = nodes[0]
+    end_node = nodes[min(3, len(nodes)-1)]
+    
+    try:
+        path = nx.shortest_path(road_graph, source=start_node, 
+                               target=end_node, weight='travel_time')
+        
+        total_time, total_distance = _calculate_path_metrics(road_graph, path)
+        
+        print(f"✓ Маршрут найден!")
+        print(f"  Количество сегментов: {len(path)-1}")
+        print(f"  Общая длина: {total_distance:.0f} м")
+        print(f"  Расчетное время: {total_time/60:.1f} мин")
+        
+        print(f"  Дороги на маршруте:")
+        _print_path_details(road_graph, path)
+        
+    except nx.NetworkXNoPath:
+        print("✗ Путь между выбранными узлами не найден")
+    except Exception as e:
+        print(f"✗ Ошибка при поиске пути: {str(e)[:100]}...")
+
+def _calculate_path_metrics(G: nx.MultiDiGraph, path: List) -> Tuple[float, float]:
+    """Рассчитывает метрики для пути."""
+    total_time, total_distance = 0.0, 0.0
+    for i in range(len(path)-1):
+        edge_data = G[path[i]][path[i+1]][0]
+        total_time += edge_data.get('travel_time', 0)
+        total_distance += edge_data.get('length', 0)
+    return total_time, total_distance
+
+def _print_path_details(G: nx.MultiDiGraph, path: List) -> None:
+    """Выводит детали пути."""
+    for i in range(len(path)-1):
+        edge_data = G[path[i]][path[i+1]][0]
+        name = edge_data.get('name', 'без названия')
+        highway_type = edge_data.get('highway_type', 'unknown')
+        length = edge_data.get('length', 0)
+        travel_time = edge_data.get('travel_time', 0)
+        print(f"    - {name} ({highway_type}, {length:.0f} м, {travel_time:.0f} с)")
+
+def _demonstrate_centrality_analysis(road_graph: nx.MultiDiGraph) -> None:
+    """Демонстрирует анализ центральности."""
+    if road_graph.number_of_nodes() == 0:
+        return
+    
+    print("\nАнализ важности узлов (топ-3 по степени центральности):")
+    try:
+        degree_centrality = nx.degree_centrality(road_graph)
+        top_nodes = sorted(degree_centrality.items(), 
+                          key=lambda x: x[1], reverse=True)[:3]
+        
+        for i, (node, centrality) in enumerate(top_nodes, 1):
+            node_data = road_graph.nodes[node]
+            x, y = node_data.get('x', 0), node_data.get('y', 0)
+            street_count = node_data.get('street_count', 0)
+            print(f"  {i}. Узел {node}:")
+            print(f"     - Центральность: {centrality:.4f}")
+            print(f"     - Координаты: ({y:.4f}°, {x:.4f}°)")
+            print(f"     - Количество дорог: {street_count}")
+    except Exception as e:
+        print(f"✗ Ошибка анализа центральности: {str(e)[:100]}...")
+
+def _demonstrate_connectivity_analysis(road_graph: nx.MultiDiGraph) -> None:
+    """Демонстрирует анализ связности."""
+    print("\nАнализ связности графа:")
+    print(f"  Граф является {'связным' if nx.is_strongly_connected(road_graph) else 'несвязным'}")
+    print(f"  Количество компонент связности: {nx.number_strongly_connected_components(road_graph)}")
+
+# Точка входа для тестирования
 if __name__ == "__main__":
-    main()
+    print("=" * 60)
+    print("ПОСТРОЕНИЕ ГРАФА ДОРОЖНОЙ СЕТИ РАЙОНА РУБЛЁВСКОГО ШОССЕ")
+    print("=" * 60)
+    
+    try:
+        # Параметры для района Рублевского шоссе
+        params = {
+            'place_name': 'Рублёвское шоссе, Москва',
+            'network_type': 'drive',
+            'simplify': True,
+            'intersection_tolerance': 15
+        }
+        
+        # Создаем или загружаем граф
+        road_graph = load_or_create_graph(**params)
+        
+        if road_graph.number_of_nodes() > 0:
+            visualize_graph(road_graph, 'rublevskoe_shosse_network.png')
+            export_graph(road_graph, 'rublevskoe_shosse')
+            _demonstrate_graph_capabilities(road_graph)
+        else:
+            print("✗ Граф пустой! Проверьте параметры запроса.")
+        
+        print("\n" + "=" * 60)
+        print("✓ ВСЕ ОПЕРАЦИИ ЗАВЕРШЕНЫ УСПЕШНО!")
+        print("=" * 60)
+        
+    except Exception as e:
+ print(f"\n✗ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+ traceback.print_exc()
